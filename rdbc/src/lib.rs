@@ -19,7 +19,11 @@
 //! }
 //! ```
 
-use tokio::stream::Stream;
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use futures::stream::StreamExt;
+use tokio::stream::{iter, Stream};
 
 /// RDBC Error
 #[derive(Debug)]
@@ -51,41 +55,62 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Represents database driver that can be shared between threads, and can therefore implement
 /// a connection pool
 pub trait Driver: Sync + Send {
+    /// The type of connection created by this driver.
+    type Connection: Connection;
+
     /// Create a connection to the database. Note that connections are intended to be used
     /// in a single thread since most database connections are not thread-safe
-    fn connect(&self, url: &str) -> Result<Box<dyn Connection>>;
+    fn connect(url: &str) -> Result<Self::Connection>;
 }
 
 /// Represents a connection to a database
 pub trait Connection {
+    /// The type of statement produced by this connection.
+    type Statement: Statement;
+
     /// Create a statement for execution
-    fn create(&mut self, sql: &str) -> Result<Box<dyn Statement + '_>>;
+    fn create(&mut self, sql: &str) -> Result<Self::Statement>;
 
     /// Create a prepared statement for execution
-    fn prepare(&mut self, sql: &str) -> Result<Box<dyn Statement + '_>>;
+    fn prepare(&mut self, sql: &str) -> Result<Self::Statement>;
 }
 
 /// Represents an executable statement
 pub trait Statement {
+    /// The type of ResultSet returned by this statement.
+    type ResultSet: ResultSet;
+
     /// Execute a query that is expected to return a result set, such as a `SELECT` statement
-    fn execute_query(&mut self, params: &[Value]) -> Result<Box<dyn ResultSet + '_>>;
+    fn execute_query(&mut self, params: &[Value]) -> Result<Self::ResultSet>;
 
     /// Execute a query that is expected to update some rows.
     fn execute_update(&mut self, params: &[Value]) -> Result<u64>;
 }
 
 /// Result set from executing a query against a statement
+#[async_trait]
 pub trait ResultSet {
-    type RowsStream: Stream<dyn Row>;
+    /// The type of metadata associated with this result set.
+    type MetaData: MetaData;
+    /// The type of row included in this result set.
+    type Row: Row;
 
     /// get meta data about this result set
-    fn meta_data(&self) -> Result<Box<dyn ResultSetMetaData>>;
+    fn meta_data(&self) -> Result<Self::MetaData>;
 
-    /// Move the cursor to the next available row if one exists and return true if it does
-    fn rows(&mut self) -> Result<Self::RowsStream>;
+    /// Get a stream where each item is a batch of rows.
+    async fn batches(&mut self) -> Result<Pin<Box<dyn Stream<Item = Vec<Self::Row>>>>>;
+
+    /// Get a stream of rows.
+    ///
+    /// Note that the rows are actually returned from the database in batches;
+    /// this just flattens the batches to provide a (possibly) simpler API.
+    async fn rows<'a>(&'a mut self) -> Result<Box<dyn Stream<Item = Self::Row> + 'a>> {
+        Ok(Box::new(self.batches().await?.map(iter).flatten()))
+    }
 }
 
-trait Row {
+pub trait Row {
     fn get_i8(&self, i: u64) -> Result<Option<i8>>;
     fn get_i16(&self, i: u64) -> Result<Option<i16>>;
     fn get_i32(&self, i: u64) -> Result<Option<i32>>;
@@ -97,7 +122,7 @@ trait Row {
 }
 
 /// Meta data for result set
-pub trait ResultSetMetaData {
+pub trait MetaData {
     fn num_columns(&self) -> u64;
     fn column_name(&self, i: u64) -> String;
     fn column_type(&self, i: u64) -> DataType;
@@ -136,7 +161,7 @@ impl Column {
     }
 }
 
-impl ResultSetMetaData for Vec<Column> {
+impl MetaData for Vec<Column> {
     fn num_columns(&self) -> u64 {
         self.len() as u64
     }
