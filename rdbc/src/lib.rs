@@ -49,42 +49,48 @@ impl ToString for Value {
     }
 }
 
-/// RDBC Result type
-pub type Result<T> = std::result::Result<T, Error>;
-
 /// Represents database driver that can be shared between threads, and can therefore implement
 /// a connection pool
+#[async_trait]
 pub trait Driver: Sync + Send {
     /// The type of connection created by this driver.
     type Connection: Connection;
 
+    type Error;
+
     /// Create a connection to the database. Note that connections are intended to be used
     /// in a single thread since most database connections are not thread-safe
-    fn connect(url: &str) -> Result<Self::Connection>;
+    async fn connect(url: &str) -> Result<Self::Connection, Self::Error>;
 }
 
 /// Represents a connection to a database
+#[async_trait]
 pub trait Connection {
     /// The type of statement produced by this connection.
     type Statement: Statement;
 
+    type Error;
+
     /// Create a statement for execution
-    fn create(&mut self, sql: &str) -> Result<Self::Statement>;
+    async fn create(&mut self, sql: &str) -> Result<Self::Statement, Self::Error>;
 
     /// Create a prepared statement for execution
-    fn prepare(&mut self, sql: &str) -> Result<Self::Statement>;
+    async fn prepare(&mut self, sql: &str) -> Result<Self::Statement, Self::Error>;
 }
 
 /// Represents an executable statement
+#[async_trait]
 pub trait Statement {
     /// The type of ResultSet returned by this statement.
     type ResultSet: ResultSet;
 
+    type Error;
+
     /// Execute a query that is expected to return a result set, such as a `SELECT` statement
-    fn execute_query(&mut self, params: &[Value]) -> Result<Self::ResultSet>;
+    async fn execute_query(&mut self, params: &[Value]) -> Result<Self::ResultSet, Self::Error>;
 
     /// Execute a query that is expected to update some rows.
-    fn execute_update(&mut self, params: &[Value]) -> Result<u64>;
+    async fn execute_update(&mut self, params: &[Value]) -> Result<u64, Self::Error>;
 }
 
 /// Result set from executing a query against a statement
@@ -95,36 +101,40 @@ pub trait ResultSet {
     /// The type of row included in this result set.
     type Row: Row;
 
+    type Error;
+
     /// get meta data about this result set
-    fn meta_data(&self) -> Result<Self::MetaData>;
+    fn meta_data(&self) -> Result<&Self::MetaData, Self::Error>;
 
     /// Get a stream where each item is a batch of rows.
-    async fn batches(&mut self) -> Result<Pin<Box<dyn Stream<Item = Vec<Self::Row>>>>>;
+    async fn batches(&mut self)
+        -> Result<Pin<Box<dyn Stream<Item = Vec<Self::Row>>>>, Self::Error>;
 
     /// Get a stream of rows.
     ///
     /// Note that the rows are actually returned from the database in batches;
     /// this just flattens the batches to provide a (possibly) simpler API.
-    async fn rows<'a>(&'a mut self) -> Result<Box<dyn Stream<Item = Self::Row> + 'a>> {
+    async fn rows<'a>(&'a mut self) -> Result<Box<dyn Stream<Item = Self::Row> + 'a>, Self::Error> {
         Ok(Box::new(self.batches().await?.map(iter).flatten()))
     }
 }
 
 pub trait Row {
-    fn get_i8(&self, i: u64) -> Result<Option<i8>>;
-    fn get_i16(&self, i: u64) -> Result<Option<i16>>;
-    fn get_i32(&self, i: u64) -> Result<Option<i32>>;
-    fn get_i64(&self, i: u64) -> Result<Option<i64>>;
-    fn get_f32(&self, i: u64) -> Result<Option<f32>>;
-    fn get_f64(&self, i: u64) -> Result<Option<f64>>;
-    fn get_string(&self, i: u64) -> Result<Option<String>>;
-    fn get_bytes(&self, i: u64) -> Result<Option<Vec<u8>>>;
+    type Error;
+    fn get_i8(&self, i: u64) -> Result<Option<i8>, Self::Error>;
+    fn get_i16(&self, i: u64) -> Result<Option<i16>, Self::Error>;
+    fn get_i32(&self, i: u64) -> Result<Option<i32>, Self::Error>;
+    fn get_i64(&self, i: u64) -> Result<Option<i64>, Self::Error>;
+    fn get_f32(&self, i: u64) -> Result<Option<f32>, Self::Error>;
+    fn get_f64(&self, i: u64) -> Result<Option<f64>, Self::Error>;
+    fn get_string(&self, i: u64) -> Result<Option<String>, Self::Error>;
+    fn get_bytes(&self, i: u64) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 
 /// Meta data for result set
 pub trait MetaData {
     fn num_columns(&self) -> u64;
-    fn column_name(&self, i: u64) -> String;
+    fn column_name(&self, i: u64) -> &str;
     fn column_type(&self, i: u64) -> DataType;
 }
 
@@ -166,8 +176,8 @@ impl MetaData for Vec<Column> {
         self.len() as u64
     }
 
-    fn column_name(&self, i: u64) -> String {
-        self[i as usize].name.clone()
+    fn column_name(&self, i: u64) -> &str {
+        &self[i as usize].name
     }
 
     fn column_type(&self, i: u64) -> DataType {

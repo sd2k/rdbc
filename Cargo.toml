@@ -5,6 +5,7 @@ members = [
 #    "rdbc-mysql",
 #    "rdbc-postgres",
 #    "rdbc-sqlite",
+     "rdbc-tokio-postgres",
 #    "rdbc-odbc",
     "rdbc-cli",
 ]
