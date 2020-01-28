@@ -52,15 +52,18 @@ impl ToString for Value {
 /// Represents database driver that can be shared between threads, and can therefore implement
 /// a connection pool
 #[async_trait]
-pub trait Driver: Sync + Send {
+pub trait Driver: Sync + Send + Sized {
     /// The type of connection created by this driver.
     type Connection: Connection;
 
     type Error;
 
+    /// Create a new database driver.
+    async fn new(url: String) -> Result<Self, Self::Error>;
+
     /// Create a connection to the database. Note that connections are intended to be used
     /// in a single thread since most database connections are not thread-safe
-    async fn connect(url: &str) -> Result<Self::Connection, Self::Error>;
+    async fn connect(&self) -> Result<Self::Connection, Self::Error>;
 }
 
 /// Represents a connection to a database
@@ -114,7 +117,9 @@ pub trait ResultSet {
     ///
     /// Note that the rows are actually returned from the database in batches;
     /// this just flattens the batches to provide a (possibly) simpler API.
-    async fn rows<'a>(&'a mut self) -> Result<Box<dyn Stream<Item = Self::Row> + 'a>, Self::Error> {
+    async fn rows<'a>(
+        &'a mut self,
+    ) -> Result<Box<dyn Stream<Item = Self::Row> + 'a + Unpin>, Self::Error> {
         Ok(Box::new(self.batches().await?.map(iter).flatten()))
     }
 }

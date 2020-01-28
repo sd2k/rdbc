@@ -1,12 +1,16 @@
 use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use sqlparser::{
     dialect::PostgreSqlDialect,
     tokenizer::{Token, Tokenizer, Word},
 };
 use tokio::stream::Stream;
-use tokio_postgres::{types::Type, Client, NoTls, Row, Statement};
+use tokio_postgres::{
+    types::{to_sql_checked, IsNull, ToSql, Type},
+    Client, NoTls, Row, Statement,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -19,15 +23,22 @@ impl From<tokio_postgres::Error> for Error {
     }
 }
 
-pub struct TokioPostgresDriver;
+pub struct TokioPostgresDriver {
+    // TODO store a connection pool here?
+    url: String,
+}
 
 #[async_trait]
 impl rdbc::Driver for TokioPostgresDriver {
     type Connection = TokioPostgresConnection;
     type Error = Error;
 
-    async fn connect(url: &str) -> Result<Self::Connection, Self::Error> {
-        let (client, conn) = tokio_postgres::connect(url, NoTls).await?;
+    async fn new(url: String) -> Result<Self, Self::Error> {
+        Ok(Self { url })
+    }
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let (client, conn) = tokio_postgres::connect(&self.url, NoTls).await?;
         tokio::spawn(conn);
         Ok(TokioPostgresConnection {
             inner: Arc::new(client),
@@ -87,38 +98,55 @@ pub struct TokioPostgresStatement {
     statement: Statement,
 }
 
-fn to_rdbc_type(ty: &Type) -> rdbc::DataType {
+fn to_rdbc_type(ty: &Type) -> Option<rdbc::DataType> {
     match ty {
-        &Type::BOOL => rdbc::DataType::Bool,
-        &Type::CHAR => rdbc::DataType::Char,
+        &Type::BOOL => Some(rdbc::DataType::Bool),
+        &Type::CHAR => Some(rdbc::DataType::Char),
         //TODO all types
-        _ => rdbc::DataType::Utf8,
+        _ => Some(rdbc::DataType::Utf8),
     }
 }
 
-fn to_postgres_params(values: &[rdbc::Value]) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> {
-    values
-        .iter()
-        .map(|v| match v {
-            rdbc::Value::String(s) => {
-                Box::new(s.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
-            }
-            rdbc::Value::Int32(n) => Box::new(*n) as Box<dyn tokio_postgres::types::ToSql + Sync>,
-            rdbc::Value::UInt32(n) => Box::new(*n) as Box<dyn tokio_postgres::types::ToSql + Sync>, //TODO all types
-        })
-        .collect()
+#[derive(Debug)]
+pub struct PostgresType<'a>(&'a rdbc::Value);
+
+impl ToSql for PostgresType<'_> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + 'static + Sync + Send>> {
+        match self.0 {
+            rdbc::Value::Int32(i) => i.to_sql(ty, out),
+            rdbc::Value::UInt32(i) => i.to_sql(ty, out),
+            rdbc::Value::String(i) => i.to_sql(ty, out),
+            // TODO add other types and convert to macro
+        }
+    }
+    to_sql_checked!();
+    fn accepts(ty: &Type) -> bool {
+        to_rdbc_type(ty).is_some()
+    }
 }
 
 #[async_trait]
 impl rdbc::Statement for TokioPostgresStatement {
     type ResultSet = TokioPostgresResultSet;
     type Error = Error;
+
     async fn execute_query(
         &mut self,
         params: &[rdbc::Value],
     ) -> Result<Self::ResultSet, Self::Error> {
-        let params = to_postgres_params(params);
-        let params: Vec<_> = params.into_iter().map(|p| p.as_ref()).collect();
+        let meta = self
+            .statement
+            .columns()
+            .iter()
+            .map(|c| rdbc::Column::new(c.name(), to_rdbc_type(c.type_()).unwrap()))
+            .collect();
+        let pg_params: Vec<_> = params.iter().map(PostgresType).collect();
+        let params: Vec<&(dyn ToSql + Sync)> =
+            pg_params.iter().map(|x| x as &(dyn ToSql + Sync)).collect();
         let rows = self
             .client
             .query(&self.statement, params.as_slice())
@@ -126,16 +154,17 @@ impl rdbc::Statement for TokioPostgresStatement {
             .into_iter()
             .map(|row| TokioPostgresRow { inner: row })
             .collect();
-        let meta = self
-            .statement
-            .columns()
-            .iter()
-            .map(|c| rdbc::Column::new(c.name(), to_rdbc_type(c.type_())))
-            .collect();
         Ok(TokioPostgresResultSet { rows, meta })
     }
+
     async fn execute_update(&mut self, params: &[rdbc::Value]) -> Result<u64, Self::Error> {
-        todo!()
+        let pg_params: Vec<_> = params.iter().map(PostgresType).collect();
+        let params: Vec<&(dyn ToSql + Sync)> =
+            pg_params.iter().map(|x| x as &(dyn ToSql + Sync)).collect();
+        Ok(self
+            .client
+            .execute(&self.statement, params.as_slice())
+            .await?)
     }
 }
 
@@ -187,5 +216,64 @@ impl rdbc::Row for TokioPostgresRow {
         get_f64 -> f64,
         get_string -> String,
         get_bytes -> Vec<u8>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use rdbc::{Connection, Driver, ResultSet, Row, Statement};
+    use tokio::stream::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_queries() -> Result<(), Error> {
+        let driver =
+            TokioPostgresDriver::new("postgres://rdbc:secret@127.0.0.1:5433".to_string()).await?;
+        let mut conn = driver.connect().await?;
+        conn.prepare("DROP TABLE IF EXISTS test")
+            .await?
+            .execute_update(&[])
+            .await?;
+        conn.prepare("CREATE TABLE test (a INT NOT NULL)")
+            .await?
+            .execute_update(&[])
+            .await?;
+        conn.prepare("INSERT INTO test (a) VALUES (?)")
+            .await?
+            .execute_update(&[rdbc::Value::Int32(123)])
+            .await?;
+        assert_eq!(
+            conn.prepare("SELECT a FROM test")
+                .await?
+                .execute_query(&[])
+                .await?
+                .batches()
+                .await?
+                .next()
+                .await
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .get_i32(1)?
+                .unwrap(),
+            123,
+        );
+        assert_eq!(
+            conn.prepare("SELECT a FROM test")
+                .await?
+                .execute_query(&[])
+                .await?
+                .rows()
+                .await?
+                .next()
+                .await
+                .unwrap()
+                .get_i32(1)?
+                .unwrap(),
+            123
+        );
+        Ok(())
     }
 }
